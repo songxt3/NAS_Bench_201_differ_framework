@@ -1,6 +1,5 @@
-import torch
-import torch.nn as nn
-
+from mindspore import nn, ops
+from mindspore.common.api import ms_function
 
 OPS = {
     "none": lambda C_in, C_out, stride, affine, track_running_stats: Zero(
@@ -14,7 +13,7 @@ OPS = {
         C_out,
         (3, 3),
         (stride, stride),
-        (1, 1),
+        (1, 1, 1, 1),
         (1, 1),
         affine,
         track_running_stats,
@@ -24,7 +23,7 @@ OPS = {
         C_out,
         (1, 1),
         (stride, stride),
-        (0, 0),
+        (0, 0, 0, 0),
         (1, 1),
         affine,
         track_running_stats,
@@ -35,7 +34,7 @@ OPS = {
 }
 
 
-class ReLUConvBN(nn.Module):
+class ReLUConvBN(nn.Cell):
     def __init__(
         self,
         C_in,
@@ -48,27 +47,28 @@ class ReLUConvBN(nn.Module):
         track_running_stats=True,
     ):
         super(ReLUConvBN, self).__init__()
-        self.op = nn.Sequential(
-            nn.ReLU(inplace=False),
+        self.op = nn.SequentialCell(
+            nn.ReLU(),
             nn.Conv2d(
-                C_in,
-                C_out,
-                kernel_size,
+                in_channels=C_in,
+                out_channels=C_out,
+                kernel_size=kernel_size,
                 stride=stride,
                 padding=padding,
+                pad_mode="pad",
                 dilation=dilation,
-                bias=not affine,
+                has_bias=not affine,
             ),
             nn.BatchNorm2d(
-                C_out, affine=affine, track_running_stats=track_running_stats
+                C_out, affine=affine
             ),
         )
 
-    def forward(self, x):
+    def construct(self, x):
         return self.op(x)
 
 
-class ResNetBasicblock(nn.Module):
+class ResNetBasicblock(nn.Cell):
     def __init__(self, inplanes, planes, stride, affine=True, track_running_stats=True):
         super(ResNetBasicblock, self).__init__()
         assert stride == 1 or stride == 2, "invalid stride {:}".format(stride)
@@ -79,10 +79,10 @@ class ResNetBasicblock(nn.Module):
             planes, planes, 3, 1, 1, 1, affine, track_running_stats
         )
         if stride == 2:
-            self.downsample = nn.Sequential(
-                nn.AvgPool2d(kernel_size=2, stride=2, padding=0),
+            self.downsample = nn.SequentialCell(
+                nn.AvgPool2d(kernel_size=2, stride=2),
                 nn.Conv2d(
-                    inplanes, planes, kernel_size=1, stride=1, padding=0, bias=False
+                    inplanes, planes, kernel_size=1, stride=1, pad_mode="valid", has_bias=False
                 ),
             )
         elif inplanes != planes:
@@ -102,7 +102,7 @@ class ResNetBasicblock(nn.Module):
         )
         return string
 
-    def forward(self, inputs):
+    def construct(self, inputs):
 
         basicblock = self.conv_a(inputs)
         basicblock = self.conv_b(basicblock)
@@ -114,7 +114,7 @@ class ResNetBasicblock(nn.Module):
         return residual + basicblock
 
 
-class POOLING(nn.Module):
+class POOLING(nn.Cell):
     def __init__(
         self, C_in, C_out, stride, mode, affine=True, track_running_stats=True
     ):
@@ -126,13 +126,13 @@ class POOLING(nn.Module):
                 C_in, C_out, 1, 1, 0, 1, affine, track_running_stats
             )
         if mode == "avg":
-            self.op = nn.AvgPool2d(3, stride=stride, padding=1, count_include_pad=False)
+            self.op = nn.AvgPool2d(3, stride=stride)
         elif mode == "max":
-            self.op = nn.MaxPool2d(3, stride=stride, padding=1)
+            self.op = nn.MaxPool2d(3, stride=stride)
         else:
             raise ValueError("Invalid mode={:} in POOLING".format(mode))
 
-    def forward(self, inputs):
+    def construct(self, inputs):
         if self.preprocess:
             x = self.preprocess(inputs)
         else:
@@ -140,7 +140,7 @@ class POOLING(nn.Module):
         return self.op(x)
 
 
-class Zero(nn.Module):
+class Zero(nn.Cell):
     def __init__(self, C_in, C_out, stride):
         super(Zero, self).__init__()
         self.C_in = C_in
@@ -148,12 +148,13 @@ class Zero(nn.Module):
         self.stride = stride
         self.is_zero = True
 
-    def forward(self, x):
+    def construct(self, x):
         if self.C_in == self.C_out:
+            mul = ops.Mul()
             if self.stride == 1:
-                return x.mul(0.0)
+                return mul(x, 0.0)
             else:
-                return x[:, :, :: self.stride, :: self.stride].mul(0.0)
+                return mul(x[:, :, :: self.stride, :: self.stride], 0.0)
         else:
             shape = list(x.shape)
             shape[1] = self.C_out
@@ -164,39 +165,42 @@ class Zero(nn.Module):
         return "C_in={C_in}, C_out={C_out}, stride={stride}".format(**self.__dict__)
 
 
-class FactorizedReduce(nn.Module):
+class FactorizedReduce(nn.Cell):
     def __init__(self, C_in, C_out, stride, affine, track_running_stats):
         super(FactorizedReduce, self).__init__()
         self.stride = stride
         self.C_in = C_in
         self.C_out = C_out
-        self.relu = nn.ReLU(inplace=False)
+        self.relu = nn.ReLU()
         if stride == 2:
             # assert C_out % 2 == 0, 'C_out : {:}'.format(C_out)
             C_outs = [C_out // 2, C_out - C_out // 2]
-            self.convs = nn.ModuleList()
+            self.convs = nn.CellList()
             for i in range(2):
                 self.convs.append(
                     nn.Conv2d(
-                        C_in, C_outs[i], 1, stride=stride, padding=0, bias=not affine
+                        C_in, C_outs[i], 1, stride=stride, pad_mode="valid", has_bias=not affine
                     )
                 )
-            self.pad = nn.ConstantPad2d((0, 1, 0, 1), 0)
+            self.pad = ConstantPad2d((0, 1, 0, 1), 0)
         elif stride == 1:
             self.conv = nn.Conv2d(
-                C_in, C_out, 1, stride=stride, padding=0, bias=not affine
+                C_in, C_out, 1, stride=stride, pad_mode="valid", has_bias=not affine
             )
         else:
             raise ValueError("Invalid stride : {:}".format(stride))
         self.bn = nn.BatchNorm2d(
-            C_out, affine=affine, track_running_stats=track_running_stats
+            C_out, affine=affine
         )
 
-    def forward(self, x):
+    def construct(self, x):
         if self.stride == 2:
             x = self.relu(x)
             y = self.pad(x)
-            out = torch.cat([self.convs[0](x), self.convs[1](y[:, :, 1:, 1:])], dim=1)
+            concat_op = ops.Concat(axis=1)
+            ## TODO: In MindSpore，converting low precision to high precision is needed before concat.
+            # out = ops.Concat([self.convs[0](x), self.convs[1](y[:, :, 1:, 1:])], dim=1)
+            out = concat_op(self.convs[0](x), self.convs[1](y[:, :, 1:, 1:]))
         else:
             out = self.conv(x)
         out = self.bn(out)
@@ -206,11 +210,11 @@ class FactorizedReduce(nn.Module):
         return "C_in={C_in}, C_out={C_out}, stride={stride}".format(**self.__dict__)
 
 
-class Identity(nn.Module):
+class Identity(nn.Cell):
     def __init__(self):
         super(Identity, self).__init__()
 
-    def forward(self, x):
+    def construct(self, x):
         return x
 
 
@@ -219,6 +223,191 @@ def drop_path(x, drop_prob):
         keep_prob = 1.0 - drop_prob
         mask = x.new_zeros(x.size(0), 1, 1, 1)
         mask = mask.bernoulli_(keep_prob)
-        x = torch.div(x, keep_prob)
-        x.mul_(mask)
+        div = ops.div()
+        x = div(x, keep_prob)
+        mul = ops.mul
+        x = mul(x, mask)
     return
+
+def _check(input_shape, padding):
+    """
+    Check relationship between input shape and padding to make sure after negative dimension padding the out is
+    positive.
+    """
+    if len(input_shape) < len(padding):
+        msg = 'Dimension of input must more than or equal to len(padding)/2'  # modify
+        raise ValueError(msg)
+    if len(input_shape) > len(padding):
+        if len(padding) == 2 and isinstance(padding[0], int):
+            padding = [(0, 0) for i in range(len(input_shape) - 1)] + [padding]
+        else:
+            padding = [(0, 0) for i in range(len(input_shape) - len(padding))] + [x for x in padding]
+    for index, item in enumerate(padding):
+        if item[0] < -input_shape[index]:
+            msg = 'Dimension out of range, expected no less than -{}, but got {}'.format(input_shape[index],
+                                                                                         item[0])
+            raise ValueError(msg)
+        if item[1] < -input_shape[index]:
+            msg = 'Dimension out of range, expected no less than -{}, but got {}'.format(input_shape[index],
+                                                                                         item[1])
+            raise ValueError(msg)
+        if input_shape[index] + item[0] + item[1] <= 0:
+            msg = 'The input size {}, plus negative padding {} and {} resulted in a non-positive output size, ' \
+                  'which is invalid. Check dimension of your input'.format(input_shape[index], item[0], item[1])
+            raise ValueError(msg)
+    return padding
+
+
+def _get_new_padding(padding):
+    """get non-negative padding and make negative position."""
+    new_padding = [[item[0], item[1]] for item in padding]
+    start = [0 for i in range(len(new_padding))]
+    end = [0 for i in range(len(new_padding))]
+    for index, item in enumerate(new_padding):
+        if item[0] < 0:
+            start[index] = item[0]
+            new_padding[index][0] = 0
+        if item[1] < 0:
+            end[index] = item[1]
+            new_padding[index][1] = 0
+    new_padding = tuple(new_padding)
+    return new_padding, start, end
+
+
+def _get_begin_size(shape, begin, end):
+    """Calculate begin and size for ops.Slice."""
+    size = tuple([shape[i] + begin[i] + end[i] for i in range(len(shape))])
+    begin = tuple([int(-i) for i in begin])
+    return begin, size
+
+class _ConstantPadNd(nn.Cell):
+    r"""
+    Using a given value to pads the last n dimensions of input tensor.
+
+    Args:
+        padding(tuple, list): The padding size to pad the last n dimensions of input tensor. The padding
+            sequence is starting from the last dimension and moving forward. The length of padding must be
+            a multiple of 2. len(padding)/2 dimensions of input will be padded.
+        value(union[int, float]): Padding value.
+
+         padding (union[list, tuple]): The padding size to pad the last n dimensions of input tensor.
+            The padding sequence is starting from the last dimension and moving forward.
+            The length of padding must be a multiple of 2. If padding is :math:`(padding_0, padding_1, padding_2,
+            padding_3, ..., padding_2m, padding_{2m+1}, ...)`. The input is `x`,
+            the size of last dimension of output is :math:`padding\_0 + x.shape[-1] + padding\_1`.
+            The size of penultimate dimension of output is :math:`padding\_2 + x.shape[-2] + padding\_3`.
+            The size of 3rd to last dimension of output is :math:`padding\_4 + x.shape[-3] + padding\_5`.
+            The size of i-td to last dimension of output is :math:`padding\_{2m} + x.shape[-m-1] + padding\_{2m+1}`.
+            The remaining dimensions of the output are consistent with those of the input.
+        value (union[int, float]): Padding value.
+
+    Returns:
+        Tensor, the tensor after padding.
+
+    Supported Platforms:
+        ``Ascend`` ``GPU`` ``CPU``
+
+    Raises:
+        ValueError: If the length of padding is not a multiple of 2.
+        ValueError: If the length of input less than len(padding)/2.
+        ValueError: If the output shape after padding is not positive.
+    """
+
+    def __init__(self, padding, value):
+        """Initialize Pad."""
+        super(_ConstantPadNd, self).__init__()
+        self.value = value
+        self.padding = self._to_ms_padding(padding)
+
+    def _to_ms_padding(self, padding):
+        """Transform the padding to the format of ms.nn.Pad."""
+        if len(padding) % 2 != 0:
+            msg = 'the length of padding must be a multiple of 2.'
+            raise ValueError(msg)
+        new_padding = []
+        for i in range(len(padding) // 2):
+            new_padding.append([padding[2 * i], padding[2 * i + 1]])
+        new_padding.reverse()
+        return new_padding
+
+    def construct(self, x):
+        """Construct the pad net."""
+        input_shape = x.shape
+        input_type = x.dtype
+        padding = _check(input_shape, self.padding)
+        new_padding, start, end = _get_new_padding(padding)
+        mask = ops.Ones()(input_shape, input_type)
+        output = ops.Pad(new_padding)(x)
+        mask = ops.Pad(new_padding)(mask)
+        ones = ops.Ones()(output.shape, output.dtype)
+        value = ops.Fill()(output.dtype, output.shape, self.value)
+        output = ops.Add()(ops.Mul()(mask, output), ops.Mul()(ops.Sub()(ones, mask), value))
+        slice_op = ops.Slice()
+        begin, size = _get_begin_size(output.shape, start, end)
+        output = slice_op(output, begin, size)
+        return output
+
+
+class ConstantPad2d(_ConstantPadNd):
+    r"""
+    Using a given constant value to pads the last two dimensions of input tensor.
+
+    Args:
+        padding (union[int, tuple]): The padding size to pad the last two dimensions of input tensor.
+            If is int, uses the same padding in boundaries of input's last two dimensions.
+            If is tuple and length of padding is 4 uses (padding_0, padding_1, padding_2, padding_3) to pad.
+            If the input is `x`, the size of last dimension of output is :math:`padding\_0 + x.shape[-1] + padding\_1`.
+            The size of penultimate dimension of output is :math:`padding\_2 + x.shape[-2] + padding\_3`.
+            The remaining dimensions of the output are consistent with those of the input.
+        value (union[int, float]): Padding value.
+
+    Returns:
+        Tensor, the tensor after padding.
+
+    Raises:
+        TypeError: If `padding` is not a tuple or int.
+        TypeError: If `value` is not int or float.
+        ValueError: If the length of `padding` is more than 4 or not a multiple of 2.
+        ValueError: If the output shape after padding is not positive.
+
+    Supported Platforms:
+        ``Ascend`` ``GPU`` ``CPU``
+
+    Examples:
+        # >>> import numpy as np
+        # >>> from mindspore import Tensor
+        # >>> from mindspore.nn import ConstantPad2d
+        # >>> x = np.ones(shape=(1, 2, 3, 4)).astype(np.float32)
+        # >>> x = Tensor(x)
+        # >>> padding = (-1, 1, 0, 1)
+        # >>> value = 0.5
+        # >>> pad2d = ConstantPad2d(padding, value)
+        # >>> out = pad2d(x)
+        # >>> print(out)
+        [[[[1.  1.  1.  0.5]
+           [1.  1.  1.  0.5]
+           [1.  1.  1.  0.5]
+           [0.5 0.5 0.5 0.5]]
+          [[1.  1.  1.  0.5]
+           [1.  1.  1.  0.5]
+           [1.  1.  1.  0.5]
+           [0.5 0.5 0.5 0.5]]]]
+        # >>> print(out.shape)
+        (1, 2, 4, 4)
+    """
+
+    def __init__(self, padding, value):
+        if isinstance(padding, int):
+            padding = (padding, padding, padding, padding)
+        elif isinstance(padding, tuple):
+            if len(padding) // 2 > 2:
+                msg = 'the length of padding with tuple type must less than or equal to 4.'
+                raise ValueError(msg)
+        else:
+            msg = 'type of padding must be int or float, but got {}'.format(type(padding))
+            raise TypeError(msg)
+
+        if not isinstance(value, (int, float)):
+            msg = 'type of value must be int or float, but got {}'.format(type(value))
+            raise TypeError(msg)
+        super(ConstantPad2d, self).__init__(padding, value)
